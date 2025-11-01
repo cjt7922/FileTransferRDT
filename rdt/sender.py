@@ -4,22 +4,22 @@ import socket
 import threading
 import time
 
-from util import PrintType, print_info, calculate_checksum
+from rdt.util import PrintType, print_info, calculate_checksum
 
 
-class TCPClient:
+class RDTSender:
     def __init__(self, port: int, timeout=8, dst_address="127.0.0.1"):
         self.src_address = "127.0.0.1"
         self.dst_address = dst_address
         self.recv_port = port
         self.send_port = self.recv_port + 1
         print(f"Sender Ports: [Recv: {self.recv_port}, Send: {self.send_port}]")
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.recv_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.send_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-        self.window_size = 4
+        self.window_size = 100
         self.seq_num = 0
         self.seq_base = 0
-        self.seq_max = self.window_size + 1
         self.window = {}
         self.received_acks = {}
         self.listener = threading.Thread(target=self.receive_acks)
@@ -29,20 +29,16 @@ class TCPClient:
         self.is_terminated = False
 
         self.timeout = timeout
-        self.data = None
-        self.chunk_number = 1
 
     def send_data(self, data: list[bytes]):
         if not self.listener.is_alive():
             self.listener.start()
 
         self.is_sending = True
-        data_list = data.copy()  # Work with copy to avoid modifying original
-        data_len = len(data_list)
+        data_list = data.copy()
 
         try:
             while (len(data_list) > 0 or any(not ack for ack in self.received_acks.values())) and self.is_sending:
-                # Send new packets
                 while self.seq_num < self.seq_base + self.window_size and len(data_list) > 0 and self.is_sending:
                     chunk = data_list.pop(0)
                     self.send_packet(self.seq_num, chunk)
@@ -53,22 +49,19 @@ class TCPClient:
                         self.received_acks[self.seq_num] = False
                     self.seq_num += 1
 
-                # Slide window
                 with self.lock:
-                    while self.seq_base in self.window and self.received_acks.get(self.seq_base,
-                                                                                  False) and self.is_sending:
+                    while self.seq_base in self.window and self.received_acks.get(self.seq_base, False) and self.is_sending:
                         del self.received_acks[self.seq_base]
                         del self.window[self.seq_base]
                         self.seq_base += 1
 
-                # Check for timeouts and retransmit (only if still sending)
                 if self.is_sending:
                     with self.lock:
                         current_time = datetime.datetime.now()
                         for seq in list(self.window.keys()):
                             if (not self.received_acks[seq] and
                                     current_time - self.window[seq][1] > datetime.timedelta(seconds=self.timeout) and
-                                    self.is_sending):  # Added check
+                                    self.is_sending):
                                 print(f"Sender: Retransmitting {seq}")
                                 self.window[seq] = (self.window[seq][0], datetime.datetime.now())
                                 self.send_packet(seq, self.window[seq][0])
@@ -94,28 +87,26 @@ class TCPClient:
         final_payload = pickle.dumps(payload)
 
         try:
-            pkt_len = len(final_payload).to_bytes(4, "big")
-            self.socket.sendto(final_payload, (self.dst_address, self.send_port))
+            self.send_socket.sendto(final_payload, (self.dst_address, self.send_port))
         except Exception as e:
             print(f"Failed to send packet: {e}")
             self.is_sending = False
             self.is_terminated = True
-            return
 
     def receive_acks(self):
         try:
-            self.socket.bind((self.src_address, self.recv_port))
-            self.socket.settimeout(self.timeout + 5)
+            self.recv_socket.bind((self.src_address, self.recv_port))
+            self.recv_socket.settimeout(self.timeout + 5)
         except Exception as e:
             print(e)
-            self.socket.close()
+            self.recv_socket.close()
             self.is_terminated = True
             self.is_sending = False
             return
 
         while self.is_sending or not self.is_terminated:
             try:
-                data, _ = self.socket.recvfrom(2048)
+                data, _ = self.recv_socket.recvfrom(2048)
                 if not data:
                     continue
                 pkt = pickle.loads(data)
@@ -130,9 +121,8 @@ class TCPClient:
                     print(f"Sender: Received ACK {pkt['ack']}")
 
             except socket.timeout:
-                continue  # normal, just check flags
+                continue
             except OSError as e:
-                # Socket was closed from another thread
                 print(f"Sender: Socket closed or error: {e}")
                 break
             except Exception as e:
@@ -162,20 +152,15 @@ class TCPClient:
 
             attempt += 1
 
-        if not self.is_terminated:
-            print("Sender: FIN-ACK not received after retries; forcing termination")
-            self.terminate_connection()
-        else:
-            # If FIN-ACK was received, gracefully close
-            print("Sender: FIN-ACK received, terminating gracefully")
-            self.terminate_connection()
+        self.terminate_connection()
 
     def terminate_connection(self):
         print("Sender: Closing connection!")
         self.is_sending = False
 
         try:
-            self.socket.close()
+            self.send_socket.close()
+            self.recv_socket.close()
         except:
             pass
 
